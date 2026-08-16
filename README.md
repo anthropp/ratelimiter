@@ -1,2 +1,2 @@
 # ratelimiter
-Distributed rate limiter take-home project for Anthropic
+Distributed rate limiter take-home project
