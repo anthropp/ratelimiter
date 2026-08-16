@@ -1,0 +1,40 @@
+# The loadgen owns the rate limiter's lifecycle (create/scale/kill), so its
+# ServiceAccount gets exactly those verbs, scoped to this namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loadgen
+  namespace: ratelimiter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: loadgen
+  namespace: ratelimiter
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: loadgen
+  namespace: ratelimiter
+subjects:
+  - kind: ServiceAccount
+    name: loadgen
+    namespace: ratelimiter
+roleRef:
+  kind: Role
+  name: loadgen
+  apiGroup: rbac.authorization.k8s.io

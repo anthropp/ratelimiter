@@ -1,0 +1,20 @@
+# The coordinator's entire configuration (spec requirement): lease size and
+# duration plus the global per-tenant limits. tenant-hi exists for the scaling
+# scenario, which measures decision throughput and needs a limit above the
+# offered load. Edit + `kubectl rollout restart deployment/coordinator -n
+# ratelimiter` to apply changes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ratelim-config
+  namespace: ratelimiter
+data:
+  config.yaml: |
+    lease:
+      size: 10
+      durationMs: 2000
+    tenants:
+      tenant-a: 100
+      tenant-b: 50
+      tenant-c: 20
+      tenant-hi: 1000

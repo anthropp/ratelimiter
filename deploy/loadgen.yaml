@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: ratelimiter
+  labels: {app: ratelim, role: loadgen}
+spec:
+  replicas: 1
+  # Recreate: the nodes are small (940m allocatable) and the loadgen is a
+  # singleton, so don't require room for two copies during an update.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: ratelim, role: loadgen}
+  template:
+    metadata:
+      labels: {app: ratelim, role: loadgen}
+    spec:
+      serviceAccountName: loadgen
+      containers:
+        - name: loadgen
+          image: us-west1-docker.pkg.dev/anthropp/ratelim/ratelim:latest
+          imagePullPolicy: Always
+          args: ["loadgen"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # The loadgen deploys the coordinator/workers with its own image.
+            - name: IMAGE
+              value: us-west1-docker.pkg.dev/anthropp/ratelim/ratelim:latest
+          resources:
+            # Small request (GKE system pods leave ~200m schedulable per
+            # e2-medium node); generous limit so the driver can burst.
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "2", memory: 512Mi}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loadgen
+  namespace: ratelimiter
+spec:
+  type: LoadBalancer
+  selector: {app: ratelim, role: loadgen}
+  ports:
+    - port: 80
+      targetPort: 8080

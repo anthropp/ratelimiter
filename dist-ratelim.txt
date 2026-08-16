@@ -1,0 +1,71 @@
+I want to build a scalable, fault-tolerant distributed rate limiter that degrades gracefully under load and failures.
+I will not be putting it into production, rather it will be submitted as a "take-home" assignment for a software engineering job application.
+
+The components we need to build are the distributed rate limiter itself (a single coordinator that is configured
+with global per-tenant rate limits, plus multiple worker rate limiter replicas that make the admission decisions locally) and
+a load generator / evaluation harness that can demonstrate the interesting
+properties of the rate limiter (e.g. graceful failure handling). The load generator will take the place of the web server / application server tier
+that would normally call a rate limiter service in a real system. So the only components in our system should be the coordinator, the
+rate limiter workers, and the load generator / evaluation client.
+
+The worker rate limiter replicas each lease a portion of the global per-tenant limits so they don't need to consult the coordinator for every admission decision;
+they only need to refill their local limit for a tenant when they run out of quota for that tenant.
+The coordinator determines the amount of limit capacity to give in a lease, and to keep things simple, the coordinator should
+use the same lease size and duration for every <tenant,worker>. The size should be
+a small enough portion of the overall limit so that when a replica crashes, we don't strand a lot of capacity, and
+also so that if new replicas join later there is some unallocated capacity that the coordinator can give to the new replica.
+
+The system should take at most six hours to design, implement, deploy, and test.
+We should deploy the system to GKE (and leave it running there for the company I'm interviewing with to try it out),
+and check in all of the code to GitHub. I have installed the `gh` CLI for you to interact with GitHub, and you can
+use the current Git branch. I have installed the `gcloud` CLI for you to interact with GCP, and I have created a Kubernetes cluster
+`cluster-1` that you can access using `kubectl`. We can change the configuration of the Kubernetes cluster (number of nodes or VM type
+for the nodes) if you think it will be beneficial for the demonstration scenarios.
+The load generator / evaluation harness and the rate limiter itself should both run on GKE, but there should be a way
+for the person who is evaluating this project to invoke the load generator / evaluation harness with different command-line arguments
+remotely (i.e. from their own laptop, without requiring any authentication and without using kubectl). 
+
+Here are some more requirements and design details. If you disagree with any of them or think any of them are unclear or should
+be changed given our overall goal, please let me know.
+
+Rate limiter
+* The coordinator should be configured using a Kubernetes ConfigMap containing the following information: lease size, lease duration,
+per-tenant rate limits. (To keep things simple, we should just have a few simulated tenants, assuming that's enough to demonstrate
+the properties we want to demonstrate.)
+* Worker rate limiters are horizontally scalable to handle more load
+* The system can tolerate failure of one or more worker rate limiter replicas
+* Worker rate limiters are able to continue admitting when the coordinator is down, until they exhaust the budget they have leased for a tenant,
+at which time they reject for that tenant (i.e. fail-closed). They periodically try to renew the lease, and should succeed when the coordinator
+comes back up.
+* High load for one tenant should not affect other tenants
+* Worker rate limiters lease global budget on demand (i.e. lease budget for a particular tenant the first time they get a request for that tenant,
+and when they exhaust their local budget for that tenant)
+* All state should be in-memory other than the ConfigMap mentioned above. It's OK for the components to lose
+their state when they crash and come back up even though this can cause over-admission. 
+
+Load generator / evaluation harness
+* Takes the following command-line arguments: per-tenant rate and concurrency, and a scenario/test name. For simplicity,
+the scenarios/tests can be hard-coded.
+* Runs for the minimum amount of time necessary to show the main point of the scenario
+* When it's done it should print the following per tenant: number of requests sent, number of requests admitted,
+number of requests rejected, errors (broken down by by http code), p50 latency, p99 latency. It would be great if it could
+also print the number of lease renewals that the coordinator received during the test, so we can demonstrate that the rate limiter workers
+are not consulting the coordinator for every admission decision.
+* If the scenario involves injecting a failure, the load generator could show a graph where the y-axis is one of those metrics and the x-axis is time,
+to demonstrate that the system may be temporarily degraded.
+* The load generator should handle all of the interaction with the Kubernetes API server to create the rate limiter components, kill pods if the scenario
+dictates killing pods, etc.
+* The load generator should be a single pod
+
+The scenarios that the load generator / evaluation harness should run are
+* normal operation: rate limiter enforces per-tenant limits, i.e. rejects (429) when tenant sends above configured rate. This includes
+when requests are handled by multiple worker rate limiters in parallel (concurrently).
+* hot tenant: when one tenant sends extreme req/sec, other tenants retain low p99 latency and correct admission rates and negligible 5xx
+* scaling: show that the maximum throughput the rate limiter system can handle increases as the number of worker replicas increases (e.g. 1, 2, 4 replicas)
+  * we can set the CPU request and limit for the worker rate limiters artificially low so that the single load generator can generate enough load to demonstrate this
+* fault tolerance 1: killing worker rate limiter pod (even without a replacement pod) only disturbs the system temporarily
+* fault tolerance 2: when the coordinator is killed the system continues working, i.e. the worker rate limiter replicas continue admitting until they exhaust their local budget and then fail closed
+
+Please formulate a detailed design, and let me know your implicit and explicit design decisions. Then we can iterate on the plan.
+Ask me if there are any missing or unclear requirements.
+You can let me know if there are other interesting scenarios we should test, but I have a limited amount of time so I'm reluctant to add much more.
