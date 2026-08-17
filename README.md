@@ -3,7 +3,7 @@
 A scalable, fault-tolerant distributed rate limiter that degrades gracefully under load
 and failures, deployed on GKE with a self-judging evaluation harness. Built as a
 take-home project; the full design (with explicit trade-offs and tuning findings) is in
-[DESIGN.md](DESIGN.md), and the original brief is in `dist-ratelim.txt`.
+[DESIGN.md](DESIGN.md), and the original brief is in [dist-ratelim.txt](dist-ratelim.txt).
 
 ## Try it (no credentials needed)
 
