@@ -64,10 +64,13 @@ simple coordinator.
 ```
 cmd/ratelim/            entrypoint: coordinator | worker | loadgen
 internal/bucket/        token bucket (unit-tested, incl. the global invariant)
-internal/config/        ConfigMap YAML parsing
-internal/coordinator/   /v1/lease, /v1/stats
-internal/worker/        local pools + lease client (unit-tested state machine)
+internal/config/        ConfigMap YAML parsing + validation (tested)
+internal/coordinator/   /v1/lease, /v1/stats (handler-level tests)
+internal/worker/        local pools + lease client (tested state machine, plus
+                        wire-contract integration tests against a real in-process
+                        coordinator)
 internal/loadgen/       k8s lifecycle, load driver, scenarios, report, HTTP server
+                        (tests for the invariant bound math and PASS/FAIL contract)
 deploy/                 bootstrap YAML: namespace, ConfigMap, RBAC, loadgen
 run.sh                  evaluator CLI (bearer token baked in — see below)
 dist-ratelim.txt        the original prompt given to Claude at the start of this project
@@ -98,13 +101,16 @@ the loadgen to its namespace, and only the fixed scenario set is exposed.
 
 | scenario | property | headline result |
 |---|---|---|
-| baseline | enforcement at the limit across concurrent workers, with a mixed-cost weighted workload (`?cost=N`); leases ≪ requests | admitted *token* rate ≈ limit, ~1 lease call per 10 requests |
-| hot-tenant | isolation: a 20× flood cannot hurt other tenants | quiet tenants 100% admitted, p99 ≈ 3 ms; flooder pinned at its limit |
-| scaling | decision throughput grows with replicas | ~610 → ~1400 → ~2330 decisions/s at 1→2→4 (5-trial spread: 2.2–2.4x and 3.8–3.9x) |
+| baseline | enforcement at the limit across concurrent workers, with a mixed-cost weighted workload (`?cost=N`); leases ≪ requests | admitted *token* rate ≈ limit ±1%; ~1 lease call per 5 requests (each request averages ~2 tokens) |
+| hot-tenant | isolation: a 20× flood cannot hurt other tenants | quiet tenants 100% admitted, single-digit-ms p99; flooder pinned at its limit |
+| scaling | decision throughput grows with replicas | ~620 → ~1200–1400 → ~2050–2350 decisions/s at 1→2→4 (ratios ≈ 2.0–2.4× and 3.3–3.9× across runs) |
 | worker-kill | abrupt worker death, no replacement | zero client-visible errors; steady state on the survivor |
 | coordinator-kill | fail-closed, then recovery | 0 admitted + clean 429s during outage, 0 errors; recovers ≈8–15 s after restore |
 
 DESIGN.md §11a records what deployment tuning surfaced — per-connection kube-proxy
 balancing, ~10 s endpoint propagation, CFS throttling, and why lease size stayed at 10
-— and §11 lists future work (tenant-fair overload shedding, adaptive lease sizing,
-peer-to-peer budget borrowing during coordinator outages, and more).
+— and §11 lists future work. Two of those items have since been implemented: weighted
+requests (F6, the `?cost=N` mixed-cost workload above) and the universal
+global-invariant assertion (F8, checked at the end of every scenario). Still open:
+tenant-fair overload shedding, adaptive lease sizing, peer-to-peer budget borrowing
+during coordinator outages, and more.
