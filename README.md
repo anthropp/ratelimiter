@@ -8,7 +8,7 @@ The full design (with explicit trade-offs and tuning findings) is in
 ## Try it (no credentials needed)
 
 The system is running on GKE. All you need is `curl` (and `python3` for `--help`
-formatting):
+formatting). The commands below invoke the evaluation harness that runs the specified tests:
 
 ```
 ./run.sh --help              # list evaluation scenarios with descriptions
