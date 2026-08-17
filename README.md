@@ -95,7 +95,7 @@ the loadgen to its namespace, and only the fixed scenario set is exposed.
 |---|---|---|
 | baseline | enforcement at the limit across concurrent workers; leases ≪ requests | admitted ≈ limit ±1%, ~1 lease call per 10 requests |
 | hot-tenant | isolation: a 20× flood cannot hurt other tenants | quiet tenants 100% admitted, p99 ≈ 3 ms; flooder pinned at its limit |
-| scaling | decision throughput grows with replicas | ~660 → ~1480 → ~2340 decisions/s at 1→2→4 |
+| scaling | decision throughput grows with replicas | ~610 → ~1400 → ~2330 decisions/s at 1→2→4 (5-trial spread: 2.2–2.4x and 3.8–3.9x) |
 | worker-kill | abrupt worker death, no replacement | zero client-visible errors; steady state on the survivor |
 | coordinator-kill | fail-closed, then recovery | 0 admitted + clean 429s during outage, 0 errors; recovers ≈8–15 s after restore |
 
