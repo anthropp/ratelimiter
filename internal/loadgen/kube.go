@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/anthropp/ratelimiter/internal/config"
 )
@@ -186,17 +187,24 @@ func (k *Kube) service(name string, selectorRole string, port int32) *corev1.Ser
 	}
 }
 
+// applyDeployment creates or updates a deployment, retrying the Get->Update
+// cycle on optimistic-concurrency conflicts: scenario setup often runs while
+// the deployment controller is still reconciling the previous scenario's
+// scale/spec changes, so a first attempt can race a controller write.
 func (k *Kube) applyDeployment(ctx context.Context, d *appsv1.Deployment) error {
-	existing, err := k.cs.AppsV1().Deployments(k.ns).Get(ctx, d.Name, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		_, err = k.cs.AppsV1().Deployments(k.ns).Create(ctx, d, metav1.CreateOptions{})
+	retriable := func(err error) bool { return errors.IsConflict(err) || errors.IsAlreadyExists(err) }
+	return retry.OnError(retry.DefaultBackoff, retriable, func() error {
+		existing, err := k.cs.AppsV1().Deployments(k.ns).Get(ctx, d.Name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			_, err = k.cs.AppsV1().Deployments(k.ns).Create(ctx, d, metav1.CreateOptions{})
+			return err
+		} else if err != nil {
+			return err
+		}
+		existing.Spec = d.Spec
+		_, err = k.cs.AppsV1().Deployments(k.ns).Update(ctx, existing, metav1.UpdateOptions{})
 		return err
-	} else if err != nil {
-		return err
-	}
-	existing.Spec = d.Spec
-	_, err = k.cs.AppsV1().Deployments(k.ns).Update(ctx, existing, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 func (k *Kube) applyService(ctx context.Context, s *corev1.Service) error {
