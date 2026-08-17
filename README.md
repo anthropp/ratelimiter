@@ -23,7 +23,8 @@ Each run streams live progress, ends with a per-tenant report (sent / admitted /
 rejected / errors by code / p50 / p99, plus coordinator lease-call counts), renders
 ASCII time-series charts for the failure scenarios, and prints a final `PASS` or
 `FAIL: <reasons>` verdict from hard-coded assertions. `run.sh` exits 0 on PASS, 1 on
-FAIL. One scenario runs at a time (HTTP 409 otherwise).
+FAIL. One scenario runs at a time; if another is already in progress, `run.sh` waits
+and retries automatically.
 
 ## Architecture
 
@@ -37,40 +38,46 @@ FAIL. One scenario runs at a time (HTTP 409 otherwise).
                                                                    duration, tenant limits
 ```
 
-- **Coordinator** holds one token bucket per tenant (refill = configured limit, burst =
-  1 s). A lease request debits up to `lease.size` tokens and returns the grant —
-  *grants are debits*: the coordinator tracks no leases, only buckets and counters, so
-  the global invariant (admitted ≤ rate × window + burst) holds for any worker count.
-- **Workers** admit from local leased tokens (requests may carry a token cost via
-  `?cost=N` — weighted rate limiting, all-or-nothing); the hot path never blocks on the
-  coordinator (one bounded exception: a genuinely cold/expired pool may wait ≤25 ms for
-  the in-flight lease instead of returning a spurious 429). Leases are fetched on
-  demand with singleflight, prefetched at a 20% low-watermark, and expire after
-  `lease.durationMs`. If the coordinator is down, workers drain their budget and then
-  **fail closed** (clean 429s), retrying with backoff until it returns.
+- **Coordinator** holds one token bucket per tenant, refilling at the configured limit
+  with burst capacity equal to one second of that rate. A lease request debits up to
+  `lease.size` tokens and returns the grant — *grants are debits*: the coordinator
+  tracks no leases, only buckets and counters, so the core guarantee (tokens admitted
+  over any window never exceed rate × window + burst) holds no matter how many workers
+  there are.
+- **Workers** make each admission decision from their local pool of leased tokens
+  (a request may declare a token cost via `?cost=N` — weighted rate limiting, admitted
+  or rejected whole, never partially). Handling a request never waits on the
+  coordinator, with one bounded exception: a pool that is empty because it was never
+  filled (or its lease expired) may wait up to 25 ms for the lease already being
+  fetched, instead of returning a needless 429. Leases are fetched on demand —
+  concurrent requests share one in-flight lease call — and renewed in the background
+  once the pool drops below 20% of the last grant; each grant expires after
+  `lease.durationMs`. If the coordinator is down, workers spend what they have and then
+  **fail closed** (clean 429s), retrying with increasing delays until it returns.
 - **Loadgen** owns the rate limiter's lifecycle through the Kubernetes API (creating,
   scaling, and force-killing pods per scenario), drives paced per-tenant load, and
   judges the outcome. It is the only hand-deployed component. Every scenario also
-  asserts the design's global invariant: per tenant, admitted tokens never exceed
-  rate × window + burst (plus bounded lease slack).
+  asserts the guarantee above per tenant, allowing only a small, bounded margin for
+  tokens that were already leased out to workers when the measurement began.
 
 All three roles are one Go binary (`ratelim`) in one container image, plain HTTP+JSON.
-All state is in-memory except the ConfigMap, by design: crash-restart may briefly
-over-admit (bounded by burst), which the design accepts in exchange for a trivially
-simple coordinator.
+All state is in-memory except the ConfigMap, by design: after a crash and restart the
+system may briefly admit more than the limit (by at most one burst), which the design
+accepts in exchange for a trivially simple coordinator.
 
 ## Repo tour
 
 ```
 cmd/ratelim/            entrypoint: coordinator | worker | loadgen
-internal/bucket/        token bucket (unit-tested, incl. the global invariant)
+internal/bucket/        token bucket (unit-tested, incl. the core guarantee)
 internal/config/        ConfigMap YAML parsing + validation (tested)
 internal/coordinator/   /v1/lease, /v1/stats (handler-level tests)
 internal/worker/        local pools + lease client (tested state machine, plus
-                        wire-contract integration tests against a real in-process
-                        coordinator)
+                        integration tests that run a real coordinator in-process
+                        to verify the HTTP protocol between the two)
 internal/loadgen/       k8s lifecycle, load driver, scenarios, report, HTTP server
-                        (tests for the invariant bound math and PASS/FAIL contract)
+                        (tests for the guarantee arithmetic and the PASS/FAIL
+                        output format run.sh depends on)
 deploy/                 bootstrap YAML: namespace, ConfigMap, RBAC, loadgen
 run.sh                  evaluator CLI (bearer token baked in — see below)
 dist-ratelim.txt        the original prompt given to Claude at the start of this project
@@ -94,23 +101,25 @@ restart the coordinator.
 
 **A note on auth:** the control endpoint is public; `/run` requires a bearer token that
 is deliberately hard-coded in `run.sh` and checked into this repo. It is demo-grade
-auth — its only job is keeping internet scanners from triggering pod kills. RBAC scopes
-the loadgen to its namespace, and only the fixed scenario set is exposed.
+auth — its only job is keeping internet scanners from triggering pod kills. The
+loadgen's Kubernetes permissions (RBAC) are limited to its own namespace, and only the
+fixed scenario set is exposed.
 
 ## What the scenarios demonstrate
 
 | scenario | property | headline result |
 |---|---|---|
-| baseline | enforcement at the limit across concurrent workers, with a mixed-cost weighted workload (`?cost=N`); leases ≪ requests | admitted *token* rate ≈ limit ±1%; ~1 lease call per 5 requests (each request averages ~2 tokens) |
+| baseline | enforcement at the limit across concurrent workers, with a mixed-cost weighted workload (`?cost=N`); far fewer coordinator calls than requests | admitted *token* rate ≈ limit ±1%; ~1 lease call per 5 requests (each request averages ~2 tokens) |
 | hot-tenant | isolation: a 20× flood cannot hurt other tenants | quiet tenants 100% admitted, single-digit-ms p99; flooder pinned at its limit |
 | scaling | decision throughput grows with replicas | ~620 → ~1200–1400 → ~2050–2350 decisions/s at 1→2→4 (ratios ≈ 2.0–2.4× and 3.3–3.9× across runs) |
 | worker-kill | abrupt worker death, no replacement | zero client-visible errors; steady state on the survivor |
 | coordinator-kill | fail-closed, then recovery | 0 admitted + clean 429s during outage, 0 errors; recovers ≈8–15 s after restore |
 
-DESIGN.md §11a records what deployment tuning surfaced — per-connection kube-proxy
-balancing, ~10 s endpoint propagation, CFS throttling, and why lease size stayed at 10
-— and §11 lists future work. Two of those items have since been implemented: weighted
-requests (F6, the `?cost=N` mixed-cost workload above) and the universal
-global-invariant assertion (F8, checked at the end of every scenario). Still open:
-tenant-fair overload shedding, adaptive lease sizing, peer-to-peer budget borrowing
-during coordinator outages, and more.
+DESIGN.md §11a records what deployment tuning surfaced — Kubernetes spreading load per
+connection rather than per request, ~10 s delays before new pods start receiving
+Service traffic, Linux CPU-quota throttling skewing latency measurements, and why lease
+size stayed at 10 — and §11 lists future work. Two of those items have since been
+implemented: weighted requests (F6, the `?cost=N` workload above) and the
+every-scenario guarantee assertion (F8). Still open: shedding load fairly across
+tenants when a worker is overloaded, adapting lease size to each tenant's traffic, and
+letting workers borrow unused budget from each other while the coordinator is down.
