@@ -1,8 +1,8 @@
 # Distributed Rate Limiter
 
 A scalable, fault-tolerant distributed rate limiter that degrades gracefully under load
-and failures, deployed on GKE with a self-judging evaluation harness. Built as a
-take-home project; the full design (with explicit trade-offs and tuning findings) is in
+and failures, deployed on GKE with a self-judging evaluation harness.
+The full design (with explicit trade-offs and tuning findings) is in
 [DESIGN.md](DESIGN.md), and the initial prompt is in [dist-ratelim.txt](dist-ratelim.txt).
 
 ## Try it (no credentials needed)
@@ -12,12 +12,22 @@ formatting):
 
 ```
 ./run.sh --help              # list evaluation scenarios with descriptions
-./run.sh baseline            # run evaluation scenario: rate limit is enforced, across concurrent rate limiter worker replicas
-./run.sh hot-tenant          # run evaluation scenario: "hot tenant" isolation under a 20x flood to one tenant
-./run.sh scaling             # run evaluation scenario: throughput increases with 1, 2, 4 worker replicas
-./run.sh worker-kill         # run evaluation scenario: rate limiter replica killed with no replacement
-./run.sh coordinator-kill    # run evaluation scenario: coordinator killed; fail-closed while the coordinator is down, then recovery
+./run.sh baseline            # run eval scenario: rate limit is enforced, across concurrent rate limiter worker replicas
+./run.sh hot-tenant          # run eval scenario: "hot tenant" isolation under a 20x flood to one tenant
+./run.sh scaling             # run eval scenario: throughput increases with 1, 2, 4 worker replicas
+./run.sh worker-kill         # run eval scenario: rate limiter replica killed with no replacement
+./run.sh coordinator-kill    # run eval scenario: coordinator killed; fail-closed while the coordinator is down, then recovery
 ```
+
+What the scenarios demonstrate
+
+| scenario | property | headline result |
+|---|---|---|
+| baseline | enforcement at the desired limit across concurrent rate limiter workers, with varying costs per request; far fewer coordinator calls than admission requests | admitted *token* rate ≈ limit ±1%; ~1 lease call per 5 requests (each request averages ~2 tokens) |
+| hot-tenant | isolation: a 20× flood by one tenant cannot hurt other tenants | quiet tenants 100% admitted, single-digit-ms p99; flooder pinned at its limit |
+| scaling | decision throughput grows with number of rate limiter worker replicas | ~620 → ~1200–1400 → ~2050–2350 decisions/s at 1→2→4 replicas |
+| worker-kill | abrupt rate limiter worker death, no replacement | zero client-visible errors; steady state on the survivor |
+| coordinator-kill | when coordinator is killed rate limiters fail-closed, then recovery | 0 admitted + clean 429s during outage, 0 errors; recovers ≈8–15 s after restore |
 
 Each run streams live progress, ends with a per-tenant report (sent / admitted /
 rejected / errors by code / p50 / p99, plus coordinator lease-call counts), renders
@@ -29,7 +39,7 @@ and retries automatically.
 ## Architecture
 
 ```
- evaluator ── curl ──► loadgen (LoadBalancer) ── admission traffic ──► worker Service
+ run.sh ──  curl  ──►  loadgen (LoadBalancer) ── admission traffic ──► worker Service
                          │                                               worker × N
                          │ k8s API: create / scale / kill                  │ lease
                          ▼                                                 ▼
@@ -43,8 +53,9 @@ and retries automatically.
   `lease.size` tokens and returns the grant — *grants are debits*: the coordinator
   tracks no leases, only buckets and counters, so the core guarantee (tokens admitted
   over any window never exceed rate × window + burst) holds no matter how many workers
-  there are.
-- **Workers** make each admission decision from their local pool of leased tokens
+  there are. To put it another way, the bucket's balance (in memory in the coordinator)
+  tracks how much remains; tokens/quota that have been granted to replicas are never taken back.
+- **Rate limiter workers** make each admission decision from their local pool of leased tokens
   (a request may declare a token cost via `?cost=N` — weighted rate limiting, admitted
   or rejected whole, never partially). Handling a request never waits on the
   coordinator, with one bounded exception: a pool that is empty because it was never
@@ -54,13 +65,11 @@ and retries automatically.
   once the pool drops below 20% of the last grant; each grant expires after
   `lease.durationMs`. If the coordinator is down, workers spend what they have and then
   **fail closed** (clean 429s), retrying with increasing delays until it returns.
-- **Loadgen** owns the rate limiter's lifecycle through the Kubernetes API (creating,
+- **Load generator** owns the rate limiter's lifecycle through the Kubernetes API (creating,
   scaling, and force-killing pods per scenario), drives paced per-tenant load, and
-  judges the outcome. It is the only hand-deployed component. Every scenario also
-  asserts the guarantee above per tenant, allowing only a small, bounded margin for
-  tokens that were already leased out to workers when the measurement began.
+  judges the outcome.
 
-All three roles are one Go binary (`ratelim`) in one container image, plain HTTP+JSON.
+All three roles are one Go binary (`ratelim`) in one container image.
 All state is in-memory except the ConfigMap, by design: after a crash and restart the
 system may briefly admit more than the limit (by at most one burst), which the design
 accepts in exchange for a trivially simple coordinator.
@@ -104,22 +113,3 @@ is deliberately hard-coded in `run.sh` and checked into this repo. It is demo-gr
 auth — its only job is keeping internet scanners from triggering pod kills. The
 loadgen's Kubernetes permissions (RBAC) are limited to its own namespace, and only the
 fixed scenario set is exposed.
-
-## What the scenarios demonstrate
-
-| scenario | property | headline result |
-|---|---|---|
-| baseline | enforcement at the limit across concurrent workers, with a mixed-cost weighted workload (`?cost=N`); far fewer coordinator calls than requests | admitted *token* rate ≈ limit ±1%; ~1 lease call per 5 requests (each request averages ~2 tokens) |
-| hot-tenant | isolation: a 20× flood cannot hurt other tenants | quiet tenants 100% admitted, single-digit-ms p99; flooder pinned at its limit |
-| scaling | decision throughput grows with replicas | ~620 → ~1200–1400 → ~2050–2350 decisions/s at 1→2→4 (ratios ≈ 2.0–2.4× and 3.3–3.9× across runs) |
-| worker-kill | abrupt worker death, no replacement | zero client-visible errors; steady state on the survivor |
-| coordinator-kill | fail-closed, then recovery | 0 admitted + clean 429s during outage, 0 errors; recovers ≈8–15 s after restore |
-
-DESIGN.md §11a records what deployment tuning surfaced — Kubernetes spreading load per
-connection rather than per request, ~10 s delays before new pods start receiving
-Service traffic, Linux CPU-quota throttling skewing latency measurements, and why lease
-size stayed at 10 — and §11 lists future work. Two of those items have since been
-implemented: weighted requests (F6, the `?cost=N` workload above) and the
-every-scenario guarantee assertion (F8). Still open: shedding load fairly across
-tenants when a worker is overloaded, adapting lease size to each tenant's traffic, and
-letting workers borrow unused budget from each other while the coordinator is down.
