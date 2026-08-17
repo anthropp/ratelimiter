@@ -33,9 +33,9 @@ type SecBucket struct {
 type TenantResult struct {
 	mu             sync.Mutex
 	Sent           int
-	Admitted       int // HTTP 200
-	AdmittedTokens int // sum of admitted requests' costs (= Admitted at cost 1)
-	Rejected       int // HTTP 429
+	Admitted       int            // HTTP 200
+	AdmittedTokens int            // sum of admitted requests' costs (= Admitted at cost 1)
+	Rejected       int            // HTTP 429
 	ClientDrops    int            // dispatch skipped: all Concurrency slots busy
 	Errors         map[string]int // other HTTP codes and transport errors
 	latencies      []float64      // milliseconds, admitted+rejected responses

@@ -269,6 +269,35 @@ func TestInsufficientCostTriggersRenewalAboveWatermark(t *testing.T) {
 	waitFor(t, func() bool { return lm.Check("a", 5) == Admit })
 }
 
+func TestConcurrentAdmissionConservesTokens(t *testing.T) {
+	// One grant of 10, then nothing: 200 racing requests must admit exactly
+	// 10 in total — token accounting may never over-admit under concurrency.
+	fl := &fakeLeaser{grant: Grant{Tokens: 10, TTL: time.Minute}}
+	lm := NewLimiter(fl)
+	if d := lm.Check("a", 1); d != Admit {
+		t.Fatalf("first check = %v, want Admit", d)
+	}
+	fl.mu.Lock()
+	fl.grant = Grant{Tokens: 0, RetryAfter: time.Hour}
+	fl.mu.Unlock()
+
+	var admits atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if lm.Check("a", 1) == Admit {
+				admits.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := admits.Load() + 1; got != 10 { // +1 for the initial check
+		t.Fatalf("total admits = %d, want exactly the 10 granted tokens", got)
+	}
+}
+
 func TestZeroGrantHonorsRetryAfterPacing(t *testing.T) {
 	fl := &fakeLeaser{grant: Grant{Tokens: 0, RetryAfter: time.Hour}}
 	lm := NewLimiter(fl)
