@@ -46,12 +46,12 @@ func renderChecks(w *Stream, checks []Check) bool {
 
 // renderTable prints the per-tenant summary table the spec asks for.
 func renderTable(w *Stream, rs Results) {
-	w.Printf("\n%-11s %9s %9s %9s %7s %9s %9s   %s\n",
-		"TENANT", "SENT", "ADMITTED", "REJECTED", "DROPS", "p50(ms)", "p99(ms)", "ERRORS")
+	w.Printf("\n%-11s %9s %9s %9s %9s %7s %9s %9s   %s\n",
+		"TENANT", "SENT", "ADMITTED", "ADM.TOK", "REJECTED", "DROPS", "p50(ms)", "p99(ms)", "ERRORS")
 	for _, name := range rs.TenantsSorted() {
 		r := rs[name]
 		r.mu.Lock()
-		sent, adm, rej, drops := r.Sent, r.Admitted, r.Rejected, r.ClientDrops
+		sent, adm, admTok, rej, drops := r.Sent, r.Admitted, r.AdmittedTokens, r.Rejected, r.ClientDrops
 		errs := make([]string, 0, len(r.Errors))
 		for code, n := range r.Errors {
 			errs = append(errs, fmt.Sprintf("%s:%d", code, n))
@@ -62,8 +62,8 @@ func renderTable(w *Stream, rs Results) {
 		if len(errs) > 0 {
 			errStr = strings.Join(errs, " ")
 		}
-		w.Printf("%-11s %9d %9d %9d %7d %9.1f %9.1f   %s\n",
-			name, sent, adm, rej, drops, r.Percentile(50), r.Percentile(99), errStr)
+		w.Printf("%-11s %9d %9d %9d %9d %7d %9.1f %9.1f   %s\n",
+			name, sent, adm, admTok, rej, drops, r.Percentile(50), r.Percentile(99), errStr)
 	}
 }
 

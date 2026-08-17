@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -61,7 +62,16 @@ type Server struct {
 
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	tenant := r.PathValue("tenant")
-	switch s.limiter.Check(tenant) {
+	cost := 1
+	if cs := r.URL.Query().Get("cost"); cs != "" {
+		v, err := strconv.Atoi(cs)
+		if err != nil || v < 1 || v > 1000 {
+			http.Error(w, "cost must be an integer in [1,1000]", http.StatusBadRequest)
+			return
+		}
+		cost = v
+	}
+	switch s.limiter.Check(tenant, cost) {
 	case Admit:
 		w.WriteHeader(http.StatusOK)
 	case Reject:

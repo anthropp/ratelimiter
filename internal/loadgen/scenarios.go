@@ -43,9 +43,10 @@ type Scenario struct {
 var Scenarios = []Scenario{
 	{
 		Name: "baseline",
-		Description: "Normal operation across 2 concurrent workers: tenant-a sends 2x its limit " +
-			"and is admitted at exactly the limit (excess gets 429), tenant-b sends 0.5x its limit " +
-			"and is fully admitted. Also verifies workers lease budget in batches instead of " +
+		Description: "Normal operation across 2 concurrent workers: tenant-a offers 2x its limit " +
+			"in tokens as a mixed-cost workload (cheap cost-1 requests plus expensive cost-5 ones) " +
+			"and is admitted at exactly its token limit (excess gets 429); tenant-b sends 0.5x its " +
+			"limit and is fully admitted. Also verifies workers lease budget in batches instead of " +
 			"consulting the coordinator per request.",
 		Run: runBaseline,
 	},
@@ -147,8 +148,12 @@ func runBaseline(ctx context.Context, env *Env) ([]Check, error) {
 	}
 	la, lb, _ := limits(env.Cfg)
 	dur := time.Duration(env.ov("duration", 30)) * time.Second
+	// Mixed-cost workload for tenant-a (weighted requests, F6): cost-1 at
+	// 1.2x the limit plus cost-5 at 0.16x the limit = 2x the limit in
+	// offered tokens/sec. Enforcement is on tokens, not requests.
 	loads := []TenantLoad{
-		{Tenant: "tenant-a", RPS: env.ov("rate_a", 2*la), Concurrency: 32},
+		{Tenant: "tenant-a", RPS: env.ov("rate_a", 1.2*la), Concurrency: 24, Cost: 1},
+		{Tenant: "tenant-a", RPS: env.ov("rate_a5", 0.16*la), Concurrency: 8, Cost: 5},
 		{Tenant: "tenant-b", RPS: env.ov("rate_b", 0.5*lb), Concurrency: 8},
 	}
 	env.warmup(ctx, loads)
@@ -157,8 +162,8 @@ func runBaseline(ctx context.Context, env *Env) ([]Check, error) {
 	if err != nil {
 		return nil, fmt.Errorf("scraping coordinator stats: %w", err)
 	}
-	env.Out.Printf("measuring %v: tenant-a @ %.0f rps (2x limit %.0f), tenant-b @ %.0f rps (0.5x limit %.0f)\n",
-		dur, loads[0].RPS, la, loads[1].RPS, lb)
+	env.Out.Printf("measuring %v: tenant-a @ %.0f rps cost-1 + %.0f rps cost-5 (2x limit %.0f tokens/s), tenant-b @ %.0f rps (0.5x limit %.0f)\n",
+		dur, loads[0].RPS, loads[1].RPS, la, loads[2].RPS, lb)
 	rs := env.Driver.Run(ctx, loads, dur, progress(env.Out))
 	s1, err := CoordStats(env.CoordURL)
 	if err != nil {
@@ -177,11 +182,11 @@ func runBaseline(ctx context.Context, env *Env) ([]Check, error) {
 
 	a, b := rs["tenant-a"], rs["tenant-b"]
 	secs := dur.Seconds()
-	admRateA := float64(a.Admitted) / secs
+	tokRateA := float64(a.AdmittedTokens) / secs
 	return []Check{
-		check("tenant-a admitted at its limit", within(admRateA, la, 0.10),
-			"%.1f/s vs limit %.0f/s (tolerance 10%%)", admRateA, la),
-		check("tenant-a excess rejected with 429", a.Rejected > 0 && pct(a.Rejected, a.Sent) > 30,
+		check("tenant-a admitted token rate at its limit (weighted requests)", within(tokRateA, la, 0.10),
+			"%.1f tokens/s vs limit %.0f/s (tolerance 10%%)", tokRateA, la),
+		check("tenant-a excess rejected with 429", a.Rejected > 0 && pct(a.Rejected, a.Sent) > 15,
 			"%d rejected of %d sent (%.0f%%)", a.Rejected, a.Sent, pct(a.Rejected, a.Sent)),
 		check("tenant-b under limit fully admitted", pct(b.Admitted, b.Sent) >= 99,
 			"%.2f%% admitted", pct(b.Admitted, b.Sent)),
@@ -189,6 +194,7 @@ func runBaseline(ctx context.Context, env *Env) ([]Check, error) {
 			"%d errors of %d requests", a.ErrorCount()+b.ErrorCount(), sent),
 		check("workers do not consult coordinator per request", renews > 0 && float64(renews) <= 0.2*float64(sent),
 			"%d lease calls vs %d requests", renews, sent),
+		invariantCheck(env, rs, dur, 2, 0),
 	}, nil
 }
 
@@ -225,6 +231,7 @@ func runHotTenant(ctx context.Context, env *Env) ([]Check, error) {
 			"%d errors of %d requests", a.ErrorCount()+b.ErrorCount()+c.ErrorCount(), totalSent(rs)),
 		check("hot tenant still gets its configured share", within(admRateA, la, 0.15),
 			"admitted %.1f/s vs limit %.0f/s (tolerance 15%%)", admRateA, la),
+		invariantCheck(env, rs, dur, 2, 0),
 	}, nil
 }
 
@@ -236,6 +243,7 @@ func runScaling(ctx context.Context, env *Env) ([]Check, error) {
 	load := []TenantLoad{{Tenant: "tenant-hi", RPS: offered, Concurrency: int(env.ov("concurrency", 200))}}
 	throughput := map[int]float64{}
 	p99 := map[int]float64{}
+	var invChecks []Check
 
 	for _, n := range []int{1, 2, 4} {
 		if err := env.ensure(ctx, int32(n), workerCPUScaling); err != nil {
@@ -267,6 +275,9 @@ func runScaling(ctx context.Context, env *Env) ([]Check, error) {
 			}
 			env.Out.Printf("\n")
 		}
+		ic := invariantCheck(env, rs, dur, n, 0)
+		ic.Name = fmt.Sprintf("%s @ %d replica(s)", ic.Name, n)
+		invChecks = append(invChecks, ic)
 	}
 	env.Out.Printf("\nreplicas  decisions/s   p99(ms)\n")
 	for _, n := range []int{1, 2, 4} {
@@ -277,7 +288,7 @@ func runScaling(ctx context.Context, env *Env) ([]Check, error) {
 		return nil, err
 	}
 
-	return []Check{
+	return append([]Check{
 		check("1 replica is saturated (test validity)", throughput[1] <= 0.9*offered,
 			"%.0f/s achieved vs %.0f/s offered; if this fails, raise the offered rate", throughput[1], offered),
 		// Thresholds sit outside the observed noise floor (per-node system-pod
@@ -288,7 +299,7 @@ func runScaling(ctx context.Context, env *Env) ([]Check, error) {
 			"%.0f/s vs %.0f/s (%.2fx)", throughput[2], throughput[1], throughput[2]/throughput[1]),
 		check("4 replicas beat 1 by >=2.0x", throughput[4] >= 2.0*throughput[1],
 			"%.0f/s vs %.0f/s (%.2fx)", throughput[4], throughput[1], throughput[4]/throughput[1]),
-	}, nil
+	}, invChecks...), nil
 }
 
 // steadyLoads is the common ~80%-of-limit load used by both failure scenarios.
@@ -362,6 +373,7 @@ func runWorkerKill(ctx context.Context, env *Env) ([]Check, error) {
 			"%d errors outside t=[%d,%d]s", errsOutside, killAt-1, killAt+6),
 		check("total errors are a small fraction", pct(totalErrs, sent) <= 2,
 			"%d of %d requests (%.2f%%)", totalErrs, sent, pct(totalErrs, sent)),
+		invariantCheck(env, rs, dur, 2, 0),
 	}, nil
 }
 
@@ -455,7 +467,39 @@ func runCoordinatorKill(ctx context.Context, env *Env) ([]Check, error) {
 			"%.1f rejects/s (offered %.0f/s), %d errors during outage", closedRej, offered, errsClosed),
 		check("recovers to baseline after coordinator returns", recoverSec >= 0 && within(recov, base, 0.10),
 			"final-10s rate %.1f/s vs %.1f/s baseline (tolerance 10%%)", recov, base),
+		// coordRestarts=1: the restarted coordinator's buckets start full, so
+		// the bound legitimately includes one extra burst (see DESIGN.md §6).
+		invariantCheck(env, rs, dur, 2, 1),
 	}, nil
+}
+
+// invariantCheck is the universal assertion (design F8) behind the whole
+// architecture: per tenant, admitted *tokens* over the measured window may
+// never exceed rate×window + burst, plus bounded slack for budget already
+// leased into worker pools when the window began (≤ workers × 1.2 × lease
+// size) and, when the scenario restarts the coordinator, one extra burst for
+// its fresh-on-start buckets (the crash over-admission bound from DESIGN.md).
+func invariantCheck(env *Env, rs Results, dur time.Duration, workers int, coordRestarts int) Check {
+	leaseSlack := float64(workers) * 1.2 * float64(env.Cfg.Lease.Size)
+	ok := true
+	detail := ""
+	for _, name := range rs.TenantsSorted() {
+		rate, known := env.Cfg.Tenants[name]
+		if !known {
+			continue
+		}
+		burst := rate * config.BurstSeconds
+		bound := rate*dur.Seconds() + burst + leaseSlack + float64(coordRestarts)*burst
+		rs[name].mu.Lock()
+		admTok := float64(rs[name].AdmittedTokens)
+		rs[name].mu.Unlock()
+		if admTok > bound {
+			ok = false
+		}
+		detail += fmt.Sprintf("%s %.0f<=%.0f  ", name, admTok, bound)
+	}
+	return check("global invariant: admitted tokens <= rate x window + burst (+slack)", ok,
+		"%s", detail)
 }
 
 func sortedKeys(m map[string]int64) []string {

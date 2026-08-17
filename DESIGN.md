@@ -70,7 +70,7 @@ tenants:
 
 ### Worker
 - State: `map[tenant]{tokens int, expiry time, lastGrant int, renewing bool}`, per-tenant mutex.
-- API: `GET /v1/check/{tenant}` → 200 admitted / 429 rejected / 404 unknown tenant (negative-cached 10s after a coordinator 404); `GET /v1/stats`; `GET /healthz`.
+- API: `GET /v1/check/{tenant}?cost=N` → 200 admitted / 429 rejected / 404 unknown tenant (negative-cached 10s after a coordinator 404); `cost` (default 1, range 1–1000) is the request's token cost — weighted rate limiting (F6), all-or-nothing (a pool below `cost` rejects and consumes nothing, and an unsatisfiable cost triggers a renewal even above the prefetch watermark so high-cost requests can't starve behind low-cost traffic); `GET /v1/stats`; `GET /healthz`.
 - Readiness is HTTP-up only — a worker with a dead coordinator is still "ready" (it serves fail-closed decisions by design).
 - CPU request/limit set low (~200m) so one loadgen can saturate workers for the scaling scenario.
 
@@ -99,7 +99,8 @@ One pod, exposed via a `LoadBalancer` Service so the evaluator can drive it from
 
 **Pass criteria** (asserted at end of run; thresholds below are initial values, to be tuned once deployed):
 
-- `baseline` — tenant-a admitted rate within ±10% of its limit; tenant-b ≥ 99% admitted; 5xx ≈ 0; coordinator renewals ≤ 20% of requests sent (demonstrating ≪ 1 coordinator call per request).
+- `baseline` — tenant-a offers 2× its limit in *tokens* as a mixed-cost workload (cost-1 at 1.2× + cost-5 at 0.16× the limit; weighted requests, F6) and its admitted **token** rate must be within ±10% of the limit; tenant-b ≥ 99% admitted; 5xx ≈ 0; coordinator renewals ≤ 20% of requests sent (demonstrating ≪ 1 coordinator call per request).
+- **Every scenario** additionally asserts the F8 global invariant: per tenant, admitted tokens ≤ rate × window + burst, plus bounded slack for budget already leased into worker pools at window start (workers × 1.2 × lease size) and, in coordinator-kill, one extra burst for the restarted coordinator's fresh buckets.
 - `hot-tenant` — tenant-b/c ≥ 99% admitted with p99 ≤ 50 ms; 5xx ≤ 0.1% for all tenants.
 - `scaling` — throughput(2 workers) ≥ 1.3 × throughput(1); throughput(4) ≥ 2.0 × throughput(1). (Thresholds sit outside the measured noise floor — observed ratios range ~1.5–3.5× — while the report prints exact numbers; see §11a.)
 - `worker-kill` — errors confined to a ≤ 5 s window around the kill; steady-state admitted rate after the kill within ±10% of before; overall 5xx ≤ 1%.
@@ -194,10 +195,10 @@ Not in scope for the initial 6-hour build; candidates for leftover time, roughly
 
 **F5 — Sticky tenant→worker routing (M, ~1 h).** Spraying a tenant across all workers multiplies stranded capacity and renewal traffic by the worker count. Consistent-hash tenants to a small subset of workers (client-side in the loadgen, standing in for a smart proxy). Demo: assert renewal counts and admission-rate accuracy improve vs. random spraying, especially for low-limit tenants. Cheap to build; makes a nice "systems insight" talking point (effective lease size ∝ 1/workers-per-tenant).
 
-**F6 — Weighted requests (S, ~30 min).** Admission cost as a query param (`?cost=5`) debiting multiple tokens, demonstrating weighted rate limiting (e.g., expensive API calls). Demo: fold into `baseline` with a mixed-cost workload; assert admitted *token* rate (not request rate) tracks the limit.
+**F6 — Weighted requests — ✅ implemented (2026-08-16).** Admission cost as a query param (`?cost=5`) debiting multiple tokens, demonstrating weighted rate limiting (e.g., expensive API calls). Folded into `baseline` with a mixed-cost workload; the pass criterion asserts admitted *token* rate (not request rate) tracks the limit. Admission is all-or-nothing, and an unsatisfiable cost triggers a renewal even above the watermark (starvation guard).
 
 **F7 — Coordinator HA via leader election (L, ~2 h+).** Active-standby coordinators using the Kubernetes Lease API; standby takes over with empty buckets (bounded over-admission per D-crash semantics, or warm-synced via F1-style returns). Shrinks the fail-closed window from "until pod reschedules" to seconds. Demo: `coordinator-kill` variant asserting a much shorter 429 window. Biggest lift, and partially redundant with F4.
 
-**F8 — Global-invariant assertion in every scenario (S, ~15 min).** The harness already has all counts; add a universal check that total admitted ≤ Σ(R × active-window + B) per tenant across *all* scenarios, including the failure ones. Turns the design's core claim into a continuously verified property. Arguably worth pulling into the initial build if the pass-criteria work goes quickly.
+**F8 — Global-invariant assertion in every scenario — ✅ implemented (2026-08-16).** A universal check, appended to every scenario's criteria (including the failure ones and each scaling phase): per tenant, admitted tokens ≤ R × window + B, plus bounded slack for pre-leased worker pools and one extra burst per coordinator restart. Turns the design's core claim — and the crash over-admission bound from §6 — into a continuously verified property.
 
 Deliberately omitted: Prometheus/Grafana observability and the HTML results page (nice demos, but they demonstrate plumbing rather than rate-limiter properties; the ASCII charts already carry the story), and config hot-reload (operationally nice, demonstrates nothing distributed).

@@ -41,7 +41,8 @@ FAIL. One scenario runs at a time (HTTP 409 otherwise).
   1 s). A lease request debits up to `lease.size` tokens and returns the grant —
   *grants are debits*: the coordinator tracks no leases, only buckets and counters, so
   the global invariant (admitted ≤ rate × window + burst) holds for any worker count.
-- **Workers** admit from local leased tokens; the hot path never blocks on the
+- **Workers** admit from local leased tokens (requests may carry a token cost via
+  `?cost=N` — weighted rate limiting, all-or-nothing); the hot path never blocks on the
   coordinator (one bounded exception: a genuinely cold/expired pool may wait ≤25 ms for
   the in-flight lease instead of returning a spurious 429). Leases are fetched on
   demand with singleflight, prefetched at a 20% low-watermark, and expire after
@@ -49,7 +50,9 @@ FAIL. One scenario runs at a time (HTTP 409 otherwise).
   **fail closed** (clean 429s), retrying with backoff until it returns.
 - **Loadgen** owns the rate limiter's lifecycle through the Kubernetes API (creating,
   scaling, and force-killing pods per scenario), drives paced per-tenant load, and
-  judges the outcome. It is the only hand-deployed component.
+  judges the outcome. It is the only hand-deployed component. Every scenario also
+  asserts the design's global invariant: per tenant, admitted tokens never exceed
+  rate × window + burst (plus bounded lease slack).
 
 All three roles are one Go binary (`ratelim`) in one container image, plain HTTP+JSON.
 All state is in-memory except the ConfigMap, by design: crash-restart may briefly
@@ -93,7 +96,7 @@ the loadgen to its namespace, and only the fixed scenario set is exposed.
 
 | scenario | property | headline result |
 |---|---|---|
-| baseline | enforcement at the limit across concurrent workers; leases ≪ requests | admitted ≈ limit ±1%, ~1 lease call per 10 requests |
+| baseline | enforcement at the limit across concurrent workers, with a mixed-cost weighted workload (`?cost=N`); leases ≪ requests | admitted *token* rate ≈ limit, ~1 lease call per 10 requests |
 | hot-tenant | isolation: a 20× flood cannot hurt other tenants | quiet tenants 100% admitted, p99 ≈ 3 ms; flooder pinned at its limit |
 | scaling | decision throughput grows with replicas | ~610 → ~1400 → ~2330 decisions/s at 1→2→4 (5-trial spread: 2.2–2.4x and 3.8–3.9x) |
 | worker-kill | abrupt worker death, no replacement | zero client-visible errors; steady state on the survivor |

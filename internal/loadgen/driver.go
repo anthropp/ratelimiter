@@ -13,11 +13,15 @@ import (
 
 func intstrFromInt(port int32) intstr.IntOrString { return intstr.FromInt32(port) }
 
-// TenantLoad describes offered load for one tenant.
+// TenantLoad describes offered load for one tenant. Cost is the per-request
+// token cost (weighted rate limiting, design F6); 0 means 1. Multiple loads
+// may target the same tenant (e.g. a mixed-cost workload) — their results
+// merge into one TenantResult.
 type TenantLoad struct {
 	Tenant      string
 	RPS         float64
 	Concurrency int
+	Cost        int
 }
 
 // SecBucket is one second of per-tenant outcome counts, for time-series charts.
@@ -27,17 +31,18 @@ type SecBucket struct {
 
 // TenantResult accumulates client-observed outcomes for one tenant.
 type TenantResult struct {
-	mu          sync.Mutex
-	Sent        int
-	Admitted    int            // HTTP 200
-	Rejected    int            // HTTP 429
-	ClientDrops int            // dispatch skipped: all Concurrency slots busy
-	Errors      map[string]int // other HTTP codes and transport errors
-	latencies   []float64      // milliseconds, admitted+rejected responses
-	Buckets     []SecBucket    // indexed by whole seconds since driver start
+	mu             sync.Mutex
+	Sent           int
+	Admitted       int // HTTP 200
+	AdmittedTokens int // sum of admitted requests' costs (= Admitted at cost 1)
+	Rejected       int // HTTP 429
+	ClientDrops    int            // dispatch skipped: all Concurrency slots busy
+	Errors         map[string]int // other HTTP codes and transport errors
+	latencies      []float64      // milliseconds, admitted+rejected responses
+	Buckets        []SecBucket    // indexed by whole seconds since driver start
 }
 
-func (r *TenantResult) record(sec int, code int, latMs float64, transportErr error) {
+func (r *TenantResult) record(sec int, code int, latMs float64, transportErr error, cost int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for len(r.Buckets) <= sec {
@@ -50,6 +55,7 @@ func (r *TenantResult) record(sec int, code int, latMs float64, transportErr err
 		b.Errors++
 	case code == http.StatusOK:
 		r.Admitted++
+		r.AdmittedTokens += cost
 		b.Admitted++
 		r.latencies = append(r.latencies, latMs)
 	case code == http.StatusTooManyRequests:
@@ -191,7 +197,14 @@ func (d *Driver) Run(ctx context.Context, loads []TenantLoad, duration time.Dura
 func (d *Driver) runTenant(ctx context.Context, l TenantLoad, res *TenantResult, start time.Time, duration time.Duration) {
 	sem := make(chan struct{}, l.Concurrency)
 	var wg sync.WaitGroup
+	cost := l.Cost
+	if cost < 1 {
+		cost = 1
+	}
 	url := fmt.Sprintf("%s/v1/check/%s", d.WorkerURL, l.Tenant)
+	if cost > 1 {
+		url += fmt.Sprintf("?cost=%d", cost)
+	}
 
 	quota := 0.0
 	tick := time.NewTicker(5 * time.Millisecond)
@@ -218,7 +231,7 @@ func (d *Driver) runTenant(ctx context.Context, l TenantLoad, res *TenantResult,
 					go func() {
 						defer wg.Done()
 						defer func() { <-sem }()
-						d.one(ctx, url, res, start)
+						d.one(ctx, url, cost, res, start)
 					}()
 				default:
 					res.mu.Lock()
@@ -230,7 +243,7 @@ func (d *Driver) runTenant(ctx context.Context, l TenantLoad, res *TenantResult,
 	}
 }
 
-func (d *Driver) one(ctx context.Context, url string, res *TenantResult, start time.Time) {
+func (d *Driver) one(ctx context.Context, url string, cost int, res *TenantResult, start time.Time) {
 	res.mu.Lock()
 	res.Sent++
 	res.mu.Unlock()
@@ -243,9 +256,9 @@ func (d *Driver) one(ctx context.Context, url string, res *TenantResult, start t
 		if ctx.Err() != nil {
 			return // shutdown, not a system error
 		}
-		res.record(sec, 0, 0, err)
+		res.record(sec, 0, 0, err, cost)
 		return
 	}
 	resp.Body.Close()
-	res.record(sec, resp.StatusCode, float64(lat.Microseconds())/1000, nil)
+	res.record(sec, resp.StatusCode, float64(lat.Microseconds())/1000, nil, cost)
 }

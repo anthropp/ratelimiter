@@ -65,10 +65,11 @@ const (
 )
 
 type Counters struct {
-	Admitted   atomic.Int64
-	Rejected   atomic.Int64
-	LeaseCalls atomic.Int64
-	LeaseErrs  atomic.Int64
+	Admitted       atomic.Int64
+	AdmittedTokens atomic.Int64 // = Admitted when every request has cost 1
+	Rejected       atomic.Int64
+	LeaseCalls     atomic.Int64
+	LeaseErrs      atomic.Int64
 }
 
 type Limiter struct {
@@ -112,8 +113,14 @@ func (lm *Limiter) counters(tenant string) *Counters {
 	return c
 }
 
-// Check makes the admission decision for one request.
-func (lm *Limiter) Check(tenant string) Decision {
+// Check makes the admission decision for one request. cost is the number of
+// tokens the request consumes (weighted rate limiting, design F6): admission
+// is all-or-nothing — a pool with fewer than cost tokens rejects and consumes
+// nothing. cost below 1 is treated as 1.
+func (lm *Limiter) Check(tenant string, cost int) Decision {
+	if cost < 1 {
+		cost = 1
+	}
 	p := lm.pool(tenant)
 	now := lm.now()
 
@@ -125,11 +132,11 @@ func (lm *Limiter) Check(tenant string) Decision {
 	if p.tokens > 0 && !now.Before(p.expiry) {
 		p.tokens = 0 // grant expired; drop stale budget (fail-closed direction)
 	}
-	admitted := p.tokens > 0
+	admitted := p.tokens >= cost
 	if admitted {
-		p.tokens--
+		p.tokens -= cost
 	}
-	needRenew := lm.shouldRenewLocked(p, now)
+	needRenew := lm.shouldRenewLocked(p, now, !admitted)
 	if needRenew {
 		p.renewing = true
 		p.renewDone = make(chan struct{})
@@ -159,8 +166,8 @@ func (lm *Limiter) Check(tenant string) Decision {
 				p.mu.Unlock()
 				return Unknown
 			}
-			if p.tokens > 0 && now.Before(p.expiry) {
-				p.tokens--
+			if p.tokens >= cost && now.Before(p.expiry) {
+				p.tokens -= cost
 				admitted = true
 			}
 			p.mu.Unlock()
@@ -170,21 +177,29 @@ func (lm *Limiter) Check(tenant string) Decision {
 	c := lm.counters(tenant)
 	if admitted {
 		c.Admitted.Add(1)
+		c.AdmittedTokens.Add(int64(cost))
 		return Admit
 	}
 	c.Rejected.Add(1)
 	return Reject
 }
 
-func (lm *Limiter) shouldRenewLocked(p *pool, now time.Time) bool {
+// insufficient marks a rejection caused by the pool holding fewer tokens than
+// the request's cost; that must trigger a renewal even when the pool is above
+// the prefetch watermark, or steady low-cost traffic could keep the pool
+// hovering just below a higher-cost request's needs forever.
+func (lm *Limiter) shouldRenewLocked(p *pool, now time.Time, insufficient bool) bool {
 	if p.renewing || now.Before(p.nextTry) {
 		return false
+	}
+	if insufficient || p.lastGrant == 0 {
+		return true
 	}
 	watermark := int(float64(p.lastGrant) * prefetchFraction)
 	if watermark < 1 {
 		watermark = 1
 	}
-	return p.tokens < watermark || p.lastGrant == 0
+	return p.tokens < watermark
 }
 
 func (lm *Limiter) renew(tenant string, p *pool) {
@@ -242,10 +257,11 @@ func (lm *Limiter) StatsSnapshot() map[string]map[string]int64 {
 	out := make(map[string]map[string]int64, len(lm.counts))
 	for tenant, c := range lm.counts {
 		out[tenant] = map[string]int64{
-			"admitted":   c.Admitted.Load(),
-			"rejected":   c.Rejected.Load(),
-			"leaseCalls": c.LeaseCalls.Load(),
-			"leaseErrs":  c.LeaseErrs.Load(),
+			"admitted":       c.Admitted.Load(),
+			"admittedTokens": c.AdmittedTokens.Load(),
+			"rejected":       c.Rejected.Load(),
+			"leaseCalls":     c.LeaseCalls.Load(),
+			"leaseErrs":      c.LeaseErrs.Load(),
 		}
 	}
 	return out
