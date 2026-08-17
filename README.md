@@ -3,7 +3,7 @@
 A scalable, fault-tolerant distributed rate limiter that degrades gracefully under load
 and failures, deployed on GKE with a self-judging evaluation harness. Built as a
 take-home project; the full design (with explicit trade-offs and tuning findings) is in
-[DESIGN.md](DESIGN.md), and the original brief is in [dist-ratelim.txt](dist-ratelim.txt).
+[DESIGN.md](DESIGN.md), and the initial prompt is in [dist-ratelim.txt](dist-ratelim.txt).
 
 ## Try it (no credentials needed)
 
@@ -11,12 +11,12 @@ The system is running on GKE. All you need is `curl` (and `python3` for `--help`
 formatting):
 
 ```
-./run.sh --help              # list scenarios with descriptions
-./run.sh baseline            # enforcement at the limit, across concurrent workers
-./run.sh hot-tenant          # tenant isolation under a 20x flood
-./run.sh scaling             # decision throughput at 1, 2, 4 worker replicas
-./run.sh worker-kill         # abrupt worker death, no replacement
-./run.sh coordinator-kill    # fail-closed while the coordinator is down, then recovery
+./run.sh --help              # list evaluation scenarios with descriptions
+./run.sh baseline            # run evaluation scenario: rate limit is enforced, across concurrent rate limiter worker replicas
+./run.sh hot-tenant          # run evaluation scenario: "hot tenant" isolation under a 20x flood to one tenant
+./run.sh scaling             # run evaluation scenario: throughput increases with 1, 2, 4 worker replicas
+./run.sh worker-kill         # run evaluation scenario: rate limiter replica killed with no replacement
+./run.sh coordinator-kill    # run evaluation scenario: coordinator killed; fail-closed while the coordinator is down, then recovery
 ```
 
 Each run streams live progress, ends with a per-tenant report (sent / admitted /
