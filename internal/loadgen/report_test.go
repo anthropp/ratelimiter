@@ -59,6 +59,33 @@ func TestRenderChecksLastLineContract(t *testing.T) {
 	}
 }
 
+// TestSumSeriesRacesBucketGrowth hammers sumSeries against concurrent
+// record() calls that keep growing the bucket array. Before the bounds check
+// this panicked with index-out-of-range whenever an append landed between
+// sumSeries's length measurement and its summing pass (crashed the loadgen
+// mid-scenario on GKE once); run with -race.
+func TestSumSeriesRacesBucketGrowth(t *testing.T) {
+	rs := Results{"t": &TenantResult{Errors: map[string]int{}}}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for sec := 0; ; sec++ {
+			select {
+			case <-stop:
+				return
+			default:
+				rs["t"].record(sec, 200, 1.0, nil, 1)
+			}
+		}
+	}()
+	for i := 0; i < 5000; i++ {
+		sumSeries(rs, func(b SecBucket) int { return b.Admitted })
+	}
+	close(stop)
+	<-done
+}
+
 func TestInvariantCheckBounds(t *testing.T) {
 	cfg := &config.Config{Tenants: map[string]float64{"t": 100}}
 	cfg.Lease.Size = 10

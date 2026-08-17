@@ -142,6 +142,12 @@ func sumSeries(rs Results, metric func(SecBucket) int) []int {
 	for _, r := range rs {
 		r.mu.Lock()
 		for i, b := range r.Buckets {
+			if i >= len(out) {
+				// A concurrent request appended a new second-bucket after
+				// maxLen was measured (the progress callback reads live
+				// results); it will be included in the next snapshot.
+				break
+			}
 			out[i] += metric(b)
 		}
 		r.mu.Unlock()
