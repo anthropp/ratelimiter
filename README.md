@@ -70,6 +70,8 @@ internal/worker/        local pools + lease client (unit-tested state machine)
 internal/loadgen/       k8s lifecycle, load driver, scenarios, report, HTTP server
 deploy/                 bootstrap YAML: namespace, ConfigMap, RBAC, loadgen
 run.sh                  evaluator CLI (bearer token baked in — see below)
+dist-ratelim.txt        the original prompt given to Claude at the start of this project
+DESIGN.md               the design doc Claude created from that prompt and our discussion
 ```
 
 ## Operating it
