@@ -27,7 +27,19 @@ for s in json.load(sys.stdin):
 fi
 
 out="$(mktemp)"
-trap 'rm -f "$out"' EXIT
-# -N disables buffering so progress streams live.
-curl -fsSN -H "Authorization: Bearer $TOKEN" "$ADDR/run?scenario=$1" | tee "$out"
+trap 'rm -f "$out" "$out.err"' EXIT
+# -N disables buffering so progress streams live. One scenario runs at a
+# time; HTTP 409 means another run (or its post-scenario cleanup, up to
+# ~2 minutes after a kill scenario) still holds the slot — wait and retry.
+for attempt in $(seq 1 10); do
+  rc=0
+  curl -fsSN -H "Authorization: Bearer $TOKEN" "$ADDR/run?scenario=$1" 2>"$out.err" | tee "$out" || rc=$?
+  if [[ $rc -eq 22 ]] && grep -q ": 409" "$out.err"; then
+    echo "another scenario is still running (HTTP 409); retrying in 30s (attempt $attempt/10)..." >&2
+    sleep 30
+    continue
+  fi
+  cat "$out.err" >&2  # surface any real curl error; empty on success
+  break
+done
 [[ "$(tail -n 1 "$out")" == PASS* ]]
