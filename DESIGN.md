@@ -35,14 +35,14 @@ All three components are one Go binary (`ratelim`) with subcommands `coordinator
 **Global accounting (coordinator).** Per tenant, a token bucket: refill rate = configured limit `R` tokens/sec, capacity `B = R × 1s` (one second of burst; see decision D6). A lease request debits `min(leaseSize, available)` tokens from the bucket and returns that grant. **Grants are debits, not tracked leases** — the coordinator keeps no per-worker or per-lease state, only the buckets and counters. Consequences:
 
 - Global invariant: tokens granted over any window ≤ `R × window + B`, so admitted ≤ that too. The limit cannot be exceeded in steady state regardless of worker count.
-- Unused tokens on a crashed/idle worker are simply lost (slight under-admission, bounded by ~2×leaseSize per worker per tenant, self-healing within one lease duration). We don't reclaim expired leases — that would require lease tracking for marginal benefit.
+- Unused tokens on a crashed/idle worker are simply lost (slight under-admission, bounded by ~1.2×leaseSize per worker per tenant — the 20% prefetch watermark plus one full grant — self-healing within one lease duration). We don't reclaim expired leases — that would require lease tracking for marginal benefit.
 
-**Local admission (worker).** Per tenant, a pool of leased tokens with an expiry (`grantTime + leaseDuration`; enforced with the worker's monotonic clock — no cross-node clock dependency). Admission check: pool > 0 → decrement, admit (200); pool empty → reject (429) immediately. Never blocks on the coordinator in the request path.
+**Local admission (worker).** Per tenant, a pool of leased tokens with an expiry (`grantTime + leaseDuration`; enforced with the worker's monotonic clock — no cross-node clock dependency). Admission check: pool ≥ cost (default 1; see the `?cost=N` API below) → subtract, admit (200); insufficient → reject (429), consuming nothing. The request path never waits on the coordinator when the tenant is known-exhausted (zero-grant pacing or backoff active); a pool that is empty because it was never filled or its lease expired may wait ≤25 ms for the in-flight lease instead of returning a spurious 429 (see D2).
 
 **Leasing (worker → coordinator).**
 - On demand: first request for a tenant, and whenever the pool empties, triggers a lease request (singleflight per tenant — concurrent exhausted requests don't stampede).
 - Prefetch: when the pool drops below 20% of the last grant, renew in the background. This keeps spurious 429s at the limit boundary negligible while preserving the headline property: coordinator sees ~`traffic / leaseSize` renewals, not one call per request.
-- Zero-grant response carries `retryAfterMs`; the worker stays empty (429s) and retries then.
+- Zero-grant response carries `retryAfterMs`; the worker stays empty (429s) and retries then, no sooner than 200 ms later (poll floor; see §11a).
 - Coordinator unreachable: retry with exponential backoff + jitter (250ms → 2s cap). Worker keeps admitting from remaining local tokens, then fails closed per tenant. Recovers on first successful renewal after the coordinator returns.
 
 **Demand-driven balance.** The kube Service spreads a tenant's requests across workers; each worker leases only as its own demand requires, so skewed load self-corrects (the busy worker just renews more often).
@@ -61,27 +61,28 @@ tenants:
   tenant-a: 100   # req/s
   tenant-b: 50
   tenant-c: 20
+  tenant-hi: 1000 # high-limit tenant used only by the scaling scenario
 ```
 
 - API:
   - `POST /v1/lease` `{"tenant":"tenant-a","worker":"<pod-name>"}` → `{"granted":10,"ttlMs":2000}`; `granted:0` includes `retryAfterMs`; unknown tenant → 404.
-  - `GET /v1/stats` → per-tenant lease-request and tokens-granted counters (loadgen scrapes start/end deltas to report renewal counts).
+  - `GET /v1/stats` → per-tenant lease-request, zero-grant, and tokens-granted counters, plus `startedMs` (the loadgen scrapes start/end deltas to report renewal counts, and uses `startedMs` to detect coordinator restarts).
   - `GET /healthz`.
 
 ### Worker
 - State: `map[tenant]{tokens int, expiry time, lastGrant int, renewing bool}`, per-tenant mutex.
 - API: `GET /v1/check/{tenant}?cost=N` → 200 admitted / 429 rejected / 404 unknown tenant (negative-cached 10s after a coordinator 404); `cost` (default 1, range 1–1000) is the request's token cost — weighted rate limiting (F6), all-or-nothing (a pool below `cost` rejects and consumes nothing, and an unsatisfiable cost triggers a renewal even above the prefetch watermark so high-cost requests can't starve behind low-cost traffic); `GET /v1/stats`; `GET /healthz`.
 - Readiness is HTTP-up only — a worker with a dead coordinator is still "ready" (it serves fail-closed decisions by design).
-- CPU request/limit set low (~200m) so one loadgen can saturate workers for the scaling scenario.
+- CPU: request 50m always (GKE system pods leave little schedulable room on e2-medium nodes); limit 400m in most scenarios, dropped to 50m in the scaling scenario so one loadgen can saturate even 4 replicas (see §11a).
 
 ### Load generator / evaluation harness
 One pod, exposed via a `LoadBalancer` Service so the evaluator can drive it from a laptop with nothing but `curl` (no kubectl). `/run` requires a bearer token that is hard-coded into both the loadgen and `run.sh` (and therefore checked into the repo — demo-grade auth whose only job is keeping random internet scanners from triggering pod kills):
 
 - `GET /scenarios` — machine-readable list of scenario names + descriptions (single source of truth: the loadgen's scenario registry).
 - `GET /run?scenario=<name>` — runs the scenario, **streaming** chunked plaintext so the evaluator watches live: the scenario description first, then progress, the final report, and a last line reading `PASS` or `FAIL: <failed checks>`. Per-tenant rates and concurrency are hard-coded per scenario — the evaluator gets no load knobs to misconfigure; optional undocumented query overrides exist for our own tuning experiments. One run at a time (409 if busy).
-- `run.sh <scenario>` is the evaluator CLI: `run.sh --help` fetches `/scenarios` and prints names + descriptions; otherwise it streams `/run` and exits 0 on `PASS`, 1 on `FAIL`.
+- `run.sh <scenario>` is the evaluator CLI: `run.sh --help` fetches `/scenarios` and prints names + descriptions; otherwise it streams `/run` and exits 0 on `PASS`, 1 on `FAIL`. On HTTP 409 (another run — or its post-kill cleanup, up to ~2 minutes — still holds the single-run slot) it waits 30 s and retries, up to 10 attempts.
 
-**Kubernetes control (client-go, in-cluster config).** Per the spec, the loadgen owns the rate limiter's lifecycle: at scenario start it creates-or-updates the coordinator and worker Deployments/Services from embedded specs, scales workers to what the scenario needs, waits for readiness, and restores steady state afterwards. Failure injection = scaling Deployments and force-deleting pods (`gracePeriodSeconds=0` for abrupt death). RBAC Role scoped to the `ratelimiter` namespace: pods get/list/delete; deployments/services get/create/patch; deployments/scale update.
+**Kubernetes control (client-go, in-cluster config).** Per the spec, the loadgen owns the rate limiter's lifecycle: at scenario start it creates-or-updates the coordinator and worker Deployments/Services from embedded specs, scales workers to what the scenario needs, waits for readiness, and restores steady state afterwards. Failure injection = scaling Deployments and force-deleting pods (`gracePeriodSeconds=0` for abrupt death). RBAC Role scoped to the `ratelimiter` namespace: pods get/list/delete/patch (patch sets the pod-deletion-cost annotation when choosing a kill victim); services get/create; configmaps get (the loadgen reads tenant limits so scenario assertions share the coordinator's source of truth); deployments get/create/update/patch (scaling is a merge-patch on the deployment; no scale subresource needed).
 
 **Load driver.** Per tenant: paced dispatch at the target rate (ticker), in-flight bounded by `concurrency` (semaphore; a full semaphore at fire time counts as client-drop, expected ≈0 since 429s are fast). Client timeout 2s, high `MaxIdleConnsPerHost`. Records per request: tenant, HTTP code (or transport error), latency.
 
@@ -91,11 +92,11 @@ One pod, exposed via a `LoadBalancer` Service so the evaluator can drive it from
 
 | name | setup | load | what it demonstrates | ~time |
 |---|---|---|---|---|
-| `baseline` | 2 workers | tenant-a at 2× limit, tenant-b at ½ limit, 30s | a admitted ≈ limit ±5%, excess 429'd; b ≈ 100% admitted; renewals ≪ requests; enforcement correct across concurrent workers | 30s |
-| `hot-tenant` | 2 workers | tenant-a at 20× limit + high concurrency; b, c below limit | b/c p99 stays low, admission correct, ~0 5xx | 30s |
+| `baseline` | 2 workers | tenant-a offers 2× its limit in tokens (mixed cost-1 + cost-5 workload), tenant-b at ½ limit, 30s | a's admitted *token* rate ≈ limit ±10%, excess 429'd; b ≈ 100% admitted; renewals ≪ requests; enforcement correct across concurrent workers | 30s |
+| `hot-tenant` | 2 workers | tenant-a at 20× limit + high concurrency; b, c below limit | b/c p99 stays low, admission correct, ~0 5xx; flooder still admitted at its own limit (±15%) | 30s |
 | `scaling` | workers = 1, 2, 4 in sequence | fixed high offered load against a high-limit tenant | max decision throughput grows with replicas (table: replicas → achieved rps, p99) | ~3 min |
-| `worker-kill` | 2 workers | all tenants at ~80% limit; at t=15s scale to 1 **and** force-delete the doomed pod (no replacement) | brief error/latency blip, ≤ ~2×leaseSize/tenant stranded, steady state on 1 worker; time-series chart | 45s |
-| `coordinator-kill` | 2 workers | tenants at ~80% limit; t=10s scale coordinator→0 (force-delete); t=25s scale back to 1 | admissions continue seconds-long on local budget, then fail-closed 429s, full recovery after restart; time-series chart | 45s |
+| `worker-kill` | 2 workers | all tenants at ~80% limit; at t=15s scale to 1 **and** force-delete the doomed pod (no replacement) | brief error/latency blip, ≤ ~1.2×leaseSize/tenant stranded, steady state on 1 worker; time-series chart | 45s |
+| `coordinator-kill` | 2 workers | tenants at ~80% limit; t=10s scale coordinator→0 (force-delete); t=25s scale back to 1 | admissions continue seconds-long on local budget, then fail-closed 429s, full recovery after restart; time-series chart | 60s |
 
 **Pass criteria** (asserted at end of run; thresholds below are initial values, to be tuned once deployed):
 
@@ -103,17 +104,17 @@ One pod, exposed via a `LoadBalancer` Service so the evaluator can drive it from
 - **Every scenario** additionally asserts the F8 global invariant: per tenant, admitted tokens ≤ rate × window + burst, plus bounded slack for budget already leased into worker pools at window start (workers × 1.2 × lease size) and, in coordinator-kill, one extra burst for the restarted coordinator's fresh buckets.
 - `hot-tenant` — tenant-b/c ≥ 99% admitted with p99 ≤ 50 ms; 5xx ≤ 0.1% for all tenants.
 - `scaling` — throughput(2 workers) ≥ 1.3 × throughput(1); throughput(4) ≥ 2.0 × throughput(1). (Thresholds sit outside the measured noise floor — observed ratios range ~1.5–3.5× — while the report prints exact numbers; see §11a.)
-- `worker-kill` — errors confined to a ≤ 5 s window around the kill; steady-state admitted rate after the kill within ±10% of before; overall 5xx ≤ 1%.
-- `coordinator-kill` — after the kill, admitted rate decays to ~0 within a few seconds and rejections are clean 429s (fail-closed, not errors); within 10 s of restart, admitted recovers to within ±10% of the pre-kill rate.
+- `worker-kill` — errors confined to an 8 s window around the kill (t = kill−1 … kill+6; ≤ 0.2% of requests may error outside it); steady-state admitted rate after the kill within ±10% of before; total errors ≤ 2%.
+- `coordinator-kill` — after the kill, admitted rate decays to ~0 within a few seconds and rejections are clean 429s (fail-closed, not errors). Time-to-recover is *reported* rather than asserted (typically 13–14 s after restore begins: pod start + endpoint propagation + lease backoff; see §11a); the assertion is that the final 10 s of the run are back within ±10% of the pre-kill rate.
 
 ## 6. Failure behavior summary
 
 | event | behavior | bound |
 |---|---|---|
-| worker crash | other workers unaffected; its unused tokens lost | ≤ ~2×leaseSize per tenant, one-time; Service endpoint lag ~seconds |
+| worker crash | other workers unaffected; its unused tokens lost | ≤ ~1.2×leaseSize per tenant, one-time; Service endpoint lag ~seconds |
 | coordinator down | workers admit from local pools, then fail closed per tenant; retry with backoff | admissions continue for roughly `localTokens / tenantRate` seconds |
 | coordinator restart | buckets reinitialize full → brief over-admission | ≤ burst B per tenant (accepted per spec) |
-| worker restart | starts empty; leases on first request | first requests 429 until first grant lands (~ms) |
+| worker restart | starts empty; leases on first request | first request waits ≤25 ms for the initial lease and typically admits — no cold-start 429s (D2 refinement) |
 | tenant floods | isolated: per-tenant buckets/pools; hot tenant's rejects are cheap (local counter check) | no cross-tenant impact |
 
 ## 7. Deployment
@@ -127,16 +128,17 @@ One pod, exposed via a `LoadBalancer` Service so the evaluator can drive it from
 
 ```
 cmd/ratelim/           # main; subcommands coordinator|worker|loadgen
-internal/bucket/       # token bucket (unit-tested)
-internal/coordinator/  # HTTP server, config load
-internal/worker/       # local pools, lease client (unit-tested)
+internal/bucket/       # token bucket
+internal/config/       # ConfigMap YAML parsing + validation
+internal/coordinator/  # HTTP server
+internal/worker/       # local pools, lease client
 internal/loadgen/      # scenario engine, k8s ops, driver, report
 deploy/                # bootstrap YAML
 Dockerfile  Makefile   # build / test / push / deploy targets
 run.sh                 # evaluator CLI wrapper around curl
 ```
 
-Unit tests only where the logic is subtle (bucket refill math, worker pool/expiry/singleflight); the harness itself is the integration test.
+Testing started where the logic is subtle (bucket refill math, worker pool/expiry/singleflight) and grew to 37 tests across all five packages: handler-level tests for both HTTP surfaces, config validation, the F8 invariant arithmetic, the PASS/FAIL output contract `run.sh` depends on, concurrency tests under the race detector, and in-process integration tests that run a real coordinator behind `httptest` to pin the worker↔coordinator wire contract. The harness remains the end-to-end test.
 
 **Time budget:** setup + skeleton 1h · coordinator + worker 2h · loadgen + scenarios 1.5h · deploy + GKE debugging + parameter tuning 1h · README/polish 0.5h. The tuning pass runs the scenarios with the hidden override parameters to settle lease size, watermark, tenant limits, and pass thresholds.
 
@@ -155,7 +157,7 @@ Unit tests only where the logic is subtle (bucket refill math, worker pool/expir
 - D10 — No evaluator-facing load parameters: per-tenant rate/concurrency are hard-coded per scenario. `run.sh` takes only the scenario name; hidden query overrides remain for our own tuning.
 
 **Implicit assumptions:**
-- "Rate limit" = requests/sec per tenant, globally, 1 token per request.
+- "Rate limit" = tokens/sec per tenant, globally; a request costs 1 token unless it declares `?cost=N` (F6).
 - Unknown tenants are rejected (404), not admitted.
 - Latency is reported over all responses (admitted + rejected) per tenant.
 - Coordinator kill mid-scenario resets its counters; the report notes this for the coordinator-kill scenario.
@@ -173,12 +175,13 @@ Unit tests only where the logic is subtle (bucket refill math, worker pool/expir
 ## 11a. Findings from the GKE tuning pass (2026-08-16)
 
 - **Lease size stays 10.** An experiment with size 20 made the smallest tenant (limit 20 rps) *worse*: one grant equals its entire 1-second burst budget, so a single worker drains the whole global bucket, starving peers into zero-grant pacing while the hoarded tokens partially expire. Empirical confirmation of the spec's "lease size must be a small fraction of the limit" guidance.
-- **Per-scenario worker CPU caps.** With workers capped at 100m everywhere, the hot-tenant flood CPU-starved the workers and CFS throttling pushed *every* tenant's p99 to ~80 ms — worker overload (future work F2), not limiter behavior. Workers now run at a 400m limit except in the scaling scenario, which keeps 100m to make saturation reachable.
+- **Per-scenario worker CPU caps.** With workers capped at 100m everywhere, the hot-tenant flood CPU-starved the workers and CFS throttling pushed *every* tenant's p99 to ~80 ms — worker overload (future work F2), not limiter behavior. Workers now run at a 400m limit except in the scaling scenario, which caps them at 50m so a single loadgen can saturate even 4 replicas while staying inside its own clean load-generation range.
 - **Requests ≠ limits on small nodes.** GKE system pods consume ~500m+ of each e2-medium node's 940m allocatable CPU, so pods request small (50–200m) and cap via limits (Burstable QoS); worker and loadgen deployments use `Recreate` so spec changes never need surge headroom.
 - **Cold-start 429s → bounded wait** (see D2 refinement): under-limit tenants with few connections saw ~2% spurious rejects when connections re-pinned to workers whose pools had expired. Fixed by the 25 ms bounded wait; zero-grant poll floor also raised 100→200 ms to halve coordinator chatter from over-limit tenants. The wait applies only to genuinely cold/expired pools — an early version that waited on every racing exhaustion serialized high-rate tenants behind singleflight renewals and capped throughput (regression-tested now).
 - **kube-proxy balances per connection, and programs iptables late.** The scaling scenario was flat across 1/2/4 replicas for three straight runs because the driver's keep-alive connections all pointed at the original pod — new replicas received literally zero requests (proven by per-worker counters, now printed in the output). Two fixes: drop idle connections between phases, and wait until every worker pod has *demonstrably served* Service traffic (probes with keep-alive disabled, so each probe re-rolls the DNAT choice) — pod readiness alone leads endpoint propagation by up to ~10 s on GKE. The same propagation lag dominates coordinator-kill recovery time (~4 s pod start + ~10 s propagation + ≤2 s lease backoff), so time-to-recover is reported as a measurement while the pass criterion asserts on the settled final 10 s.
 - **The load generator is part of the system under test.** On a shared 2-vCPU node it generates ~2000 rps cleanly; beyond that, client-side queueing caps throughput at `concurrency / latency` regardless of server capacity (three identical flat-line runs before diagnosis). The scaling scenario is sized so 4 workers' total capacity (~2300/s at 50m each) stays inside the client's clean range.
 - **Scenario runtime knobs** (final values): baseline/hot-tenant 30 s; scaling 3×25 s at 2500 rps offered, concurrency 200, workers 50m (25 s phases average out CFS/placement noise that swung 15 s phases by ~30%); worker-kill 45 s, kill at t=15; coordinator-kill 60 s, kill t=10, restore t=25.
+- **Isolated evaluator-experience testing found two latent bugs (2026-08-17).** Running the README's "Try it" flow from a fresh anonymous clone under a sanitized environment (bare system PATH, throwaway HOME, stock macOS tools) surfaced: (a) scenario setup racing the deployment controller's reconciliation of the previous scenario's changes — the loadgen's create-or-update now retries on the resulting optimistic-concurrency conflict; and (b) a crash: the per-second progress callback reads live results while the driver records, and a request landing on a new whole-second boundary between `sumSeries`'s length measurement and its summing pass grew a bucket array past the output slice, panicking the loadgen mid-scenario. Both fixed with regression tests (the latter reproduces the exact panic against the old code under `-race`). The full suite subsequently passed 5/5 from a plain `git clone` of `main`.
 - **Repeatability, measured (2026-08-16):** after the hardening above, the full five-scenario suite was run 5× back-to-back against the live deployment: **25/25 scenario runs passed**. Scaling ratios clustered at 2.21–2.43× (2 replicas, threshold ≥1.3×) and 3.75–3.92× (4 replicas, threshold ≥2.0×) — the 25 s phases cut the ratio spread by roughly 4× versus 15 s phases. Coordinator-kill recovery was 13–14 s after restore in every trial (pod start + endpoint propagation + lease backoff), consistent with the platform analysis above. Worker-kill turned out *cleaner* than designed — zero client-visible errors — because Go's HTTP client transparently retries idempotent requests whose reused connection died with the pod.
 
 ## 11. Future work
